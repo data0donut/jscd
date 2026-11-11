@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          pkg_ver="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+          test "${GITHUB_REF_NAME}" = "v${pkg_ver}"
+      - name: cargo test & clippy
+        run: |
+          cargo test --release
+          cargo clippy --all-targets -- -D warnings
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: cargo build & e2e smoke
+        run: |
+          cargo build --release
+          scripts/ci_smoke.sh
+
+  build:
+    needs: checks
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64 (Static musl)
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: linux-amd64
+            ext: ""
+            apt: musl-tools
+            linker_env: CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER
+            linker: musl-gcc
+          # Windows x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-amd64
+            ext: ".exe"
+            apt: ""
+            linker_env: ""
+            linker: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross linker (Linux)
+        if: matrix.os == 'ubuntu-24.04'
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build
+        shell: bash
+        env:
+          LINKER_ENV: ${{ matrix.linker_env }}
+          LINKER: ${{ matrix.linker }}
+        run: |
+          if [ -n "$LINKER_ENV" ]; then
+            export "$LINKER_ENV=$LINKER"
+          fi
+          cargo build --release --target "${{ matrix.target }}"
+
+      - name: Collect & UPX Compress
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          SRC="target/${{ matrix.target }}/release/jscd${{ matrix.ext }}"
+          OUT="jscd-${VERSION}-${{ matrix.asset }}${{ matrix.ext }}"
+          mkdir -p dist
+          cp "$SRC" "dist/$OUT"
+          echo "OUT=dist/$OUT" >> "$GITHUB_ENV"
+
+          # 尽力而为 UPX 压缩
+          if [ "${{ matrix.os }}" = "ubuntu-24.04" ]; then
+            sudo apt-get install -y upx-ucl || true
+            upx --best --lzma "dist/$OUT" || echo "upx 压缩失败，保留原文件"
+          elif [[ "${{ matrix.os }}" == windows* ]]; then
+            choco install upx --no-progress -y || true
+            upx --best --lzma "dist/$OUT" || echo "upx 压缩失败，保留原文件"
+          fi
+          ls -l "dist/$OUT"
+
+      - name: Compose release body
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          subject=""
+          body=""
+          if [ "$(git cat-file -t "refs/tags/$tag" 2>/dev/null || echo none)" = "tag" ]; then
+            subject="$(git tag -l --format='%(contents:subject)' "$tag" 2>/dev/null || true)"
+            body="$(git tag -l --format='%(contents:body)' "$tag" 2>/dev/null || true)"
+          fi
+          if [ -n "$subject$body" ]; then
+            { printf '%s\n' "$subject"; if [ -n "$body" ]; then printf '\n%s\n' "$body"; fi } > release-body.md
+          else
+            sed "s/@VERSION@/$tag/g" .github/release-body.md > release-body.md
+          fi
+
+      - name: Upload to release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: jscd ${{ github.ref_name }}
+          body_path: release-body.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ env.OUT }}
+
+      - name: Upload as workflow artifact (manual dry-run only)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ env.OUT }}
+          compression-level: 0
